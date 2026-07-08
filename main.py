@@ -1,78 +1,123 @@
 import time
 import uuid
-from collections import deque
+from collections import defaultdict, deque
 
-from fastapi import FastAPI, Request
-from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
-from fastapi.responses import Response
+from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-start_time = time.time()
-
-logs = deque(maxlen=1000)
-
-REQUEST_COUNTER = Counter(
-    "http_requests_total",
-    "Total HTTP requests"
+# Allow browser access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+TOTAL_ORDERS = 58
+RATE_LIMIT = 18
+WINDOW = 10  # seconds
+
+# -----------------------------
+# Fixed catalog (IDs 1..58)
+# -----------------------------
+catalog = [
+    {
+        "id": i,
+        "item": f"Item {i}",
+        "price": float(i * 10)
+    }
+    for i in range(1, TOTAL_ORDERS + 1)
+]
+
+# -----------------------------
+# Idempotency storage
+# -----------------------------
+idempotency_store = {}
+
+# -----------------------------
+# Rate limiting
+# -----------------------------
+client_requests = defaultdict(deque)
 
 
 @app.middleware("http")
-async def log_requests(request: Request, call_next):
+async def rate_limit(request, call_next):
 
-    request_id = str(uuid.uuid4())
+    client_id = request.headers.get("X-Client-Id", "anonymous")
 
-    response = await call_next(request)
+    now = time.time()
 
-    REQUEST_COUNTER.inc()
+    bucket = client_requests[client_id]
 
-    logs.append(
-        {
-            "level": "INFO",
-            "ts": time.time(),
-            "path": request.url.path,
-            "request_id": request_id,
-        }
-    )
+    while bucket and bucket[0] <= now - WINDOW:
+        bucket.popleft()
 
-    response.headers["X-Request-ID"] = request_id
+    if len(bucket) >= RATE_LIMIT:
+        retry_after = max(1, int(WINDOW - (now - bucket[0])))
 
-    return response
+        return JSONResponse(
+            status_code=429,
+            headers={
+                "Retry-After": str(retry_after)
+            },
+            content={
+                "detail": "Rate limit exceeded"
+            },
+        )
+
+    bucket.append(now)
+
+    return await call_next(request)
 
 
-@app.get("/work")
-def work(n: int):
+# ---------------------------------------------------
+# POST /orders
+# ---------------------------------------------------
 
-    total = 0
+@app.post("/orders", status_code=201)
+def create_order(
+    idempotency_key: str = Header(..., alias="Idempotency-Key")
+):
 
-    for i in range(n):
-        total += i
+    if idempotency_key in idempotency_store:
+        return idempotency_store[idempotency_key]
 
-    return {
-        "email": "23f3000737@ds.study.iitm.ac.in",
-        "done": n
+    order = {
+        "id": str(uuid.uuid4()),
+        "status": "created"
     }
 
+    idempotency_store[idempotency_key] = order
 
-@app.get("/metrics")
-def metrics():
-    return Response(
-        generate_latest(),
-        media_type=CONTENT_TYPE_LATEST
-    )
+    return order
 
 
-@app.get("/healthz")
-def health():
+# ---------------------------------------------------
+# GET /orders
+# ---------------------------------------------------
+
+@app.get("/orders")
+def list_orders(
+    limit: int = Query(10, ge=1),
+    cursor: str | None = None
+):
+
+    start = 0
+
+    if cursor:
+        start = int(cursor)
+
+    items = catalog[start:start + limit]
+
+    next_cursor = None
+
+    if start + limit < TOTAL_ORDERS:
+        next_cursor = str(start + limit)
 
     return {
-        "status": "ok",
-        "uptime_s": time.time() - start_time
+        "items": items,
+        "next_cursor": next_cursor
     }
-
-
-@app.get("/logs/tail")
-def tail(limit: int = 10):
-
-    return list(logs)[-limit:]
